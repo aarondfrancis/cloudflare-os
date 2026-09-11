@@ -13,6 +13,7 @@ import type {
 import { ContextApiProvider } from "../bridge";
 import type { SkillNavigatorCollection } from "./skillNavigatorModel";
 import { SkillsNavigatorTree } from "./SkillsNavigatorTree";
+import type { UploadSkillsTarget } from "./UploadSkillsDialog";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -68,10 +69,12 @@ describe("SkillsNavigatorTree", () => {
     writable,
     manageable = writable,
     source = "web",
+    onUploadSkills = () => {},
   }: {
     writable: boolean;
     manageable?: boolean;
     source?: "web" | "git";
+    onUploadSkills?: (target: UploadSkillsTarget) => void;
   }) => {
     container = document.createElement("div");
     document.body.append(container);
@@ -95,6 +98,7 @@ describe("SkillsNavigatorTree", () => {
             expandAll
             onSelectSkill={() => {}}
             onAddSkill={() => {}}
+            onUploadSkills={onUploadSkills}
             onEditCollection={() => {}}
             onDelete={() => {}}
             onChanged={() => {}}
@@ -155,5 +159,24 @@ describe("SkillsNavigatorTree", () => {
       await Promise.resolve();
     });
     expect(syncContextCollectionArtifactSource).toHaveBeenCalledWith("collection");
+  });
+
+  it("uploads skills into a writable legacy directory from its context menu", () => {
+    const onUploadSkills = vi.fn<(target: UploadSkillsTarget) => void>();
+    renderTree({ writable: true, onUploadSkills });
+
+    act(() => row("legacy")?.dispatchEvent(new MouseEvent("contextmenu", {
+      bubbles: true,
+      cancelable: true,
+    })));
+    const upload = [...document.body.querySelectorAll<HTMLElement>("[role=menuitem]")]
+      .find((item) => item.textContent?.includes("Upload skills"));
+    act(() => upload?.click());
+
+    expect(onUploadSkills).toHaveBeenCalledWith({
+      collectionId: "collection",
+      directoryPath: "legacy",
+      collectionEditable: false,
+    });
   });
 });

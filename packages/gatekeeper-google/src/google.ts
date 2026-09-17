@@ -17,8 +17,9 @@ import type {
   SpreadsheetValueMode,
 } from "./sheets-types";
 import {
-  assertMarkdownRangeEditable, computeReplaceOperations, docTabToMarkdown, markdownToDocRequests,
-  type DocTabSnapshot, type MarkdownRange,
+  applyMarkdownEdit, canonicalizeMarkdownForWrite, canonicalizeMarkdownReplacement,
+  computeReplaceOperations, docTabToMarkdown, markdownToDocRequests, MARKDOWN_RENDERING_VERSION,
+  type DocTabSnapshot, type EditableMarkdown,
 } from "./markdown-converter";
 import { DriveApi, DriveApiRequestError } from "./drive-api";
 import { driveObserverTracker } from "./drive-observers";
@@ -1132,8 +1133,6 @@ const DOC_METADATA_REVISION_KEY = "docMetadataRevision";
 const DOC_SNAPSHOT_TTL_MS = 10_000;
 /** The last document read. Pending actions overlay it, so it outlives none. */
 const DOC_SNAPSHOT_KEY = "docSnapshot";
-/** Rendering schema stored under {@link DOC_SNAPSHOT_KEY}; bump whenever cached output changes. */
-const DOC_SNAPSHOT_FORMAT_VERSION = 6;
 /** Name prefix of the named range that marks one Gadgets write. Permanent: retries match on it. */
 const WRITE_MARKER_PREFIX = "gadgets-write-";
 
@@ -1203,7 +1202,8 @@ type GoogleDocTabSnapshot = DocTabSnapshot & { committedWriteIds: string[] };
 
 /** A whole document as this gatekeeper caches it: one independent rendering per tab. */
 type GoogleDocSnapshot = {
-  formatVersion: typeof DOC_SNAPSHOT_FORMAT_VERSION;
+  /** Rendering schema of `tabs`; bumped by the converter that produced them. */
+  formatVersion: typeof MARKDOWN_RENDERING_VERSION;
   title: string;
   /** Absent unless the caller can edit the document; see `GoogleDocsDocument.revisionId`. */
   revisionId?: string;
@@ -1214,7 +1214,7 @@ type GoogleDocSnapshot = {
 
 function googleDocSnapshot(document: GoogleDocsDocument): GoogleDocSnapshot {
   return {
-    formatVersion: DOC_SNAPSHOT_FORMAT_VERSION,
+    formatVersion: MARKDOWN_RENDERING_VERSION,
     title: document.title,
     revisionId: document.revisionId,
     tabs: document.tabs.map(tab => ({
@@ -1227,14 +1227,11 @@ function googleDocSnapshot(document: GoogleDocsDocument): GoogleDocSnapshot {
 
 /** Accept a cached snapshot only if it predates nothing this code depends on. */
 function isGoogleDocSnapshot(value: unknown): value is GoogleDocSnapshot {
-  if (!value || typeof value !== "object" ||
-      !("formatVersion" in value) || !("title" in value) || !("tabs" in value) ||
-      !("fetchedAt" in value)) return false;
-  let revisionId = "revisionId" in value ? value.revisionId : undefined;
-  return value.formatVersion === DOC_SNAPSHOT_FORMAT_VERSION && typeof value.title === "string" &&
-      Array.isArray(value.tabs) &&
-      (revisionId === undefined || typeof revisionId === "string") &&
-      typeof value.fetchedAt === "number" && Number.isFinite(value.fetchedAt);
+  if (!value || typeof value !== "object") return false;
+  let {formatVersion, title, tabs, revisionId, fetchedAt} = value as Partial<GoogleDocSnapshot>;
+  return formatVersion === MARKDOWN_RENDERING_VERSION && typeof title === "string" &&
+      Array.isArray(tabs) && (revisionId === undefined || typeof revisionId === "string") &&
+      typeof fetchedAt === "number" && Number.isFinite(fetchedAt);
 }
 
 /**
@@ -1317,13 +1314,33 @@ function parseGoogleDocWriteReceipt(value: unknown): GoogleDocWriteReceipt | und
 
 type GoogleDocPendingAction = { id: number; action: GoogleDocAction };
 
-type GoogleDocSimulatedContent = {
-  markdown: string;
-  protectedRanges: MarkdownRange[];
+type GoogleDocSimulatedContent = EditableMarkdown & {
+  /** The valid document insertion point for an append, absent after trailing structure. */
+  appendIndex: number | undefined;
 };
 
+function googleDocAppendIndex(tab: GoogleDocTabSnapshot): number | undefined {
+  return tab.sourceMap.blocks.at(-1)?.docEnd === tab.bodyEndIndex
+    ? tab.bodyEndIndex - 1
+    : undefined;
+}
+
+function requireGoogleDocAppendIndex(appendIndex: number | undefined): number {
+  if (appendIndex === undefined) {
+    throw new Error(
+      "appendText: the selected tab does not end in a paragraph. " +
+      "Add a paragraph after its final table or structural element and retry.",
+    );
+  }
+  return appendIndex;
+}
+
 function googleDocSimulatedContent(tab: GoogleDocTabSnapshot): GoogleDocSimulatedContent {
-  return { markdown: tab.markdown, protectedRanges: tab.sourceMap.protectedRanges };
+  return {
+    markdown: tab.markdown,
+    protectedRanges: tab.sourceMap.protectedRanges,
+    appendIndex: googleDocAppendIndex(tab),
+  };
 }
 
 /** One replay of the pending queue, keyed by the state it was computed from. */
@@ -1378,38 +1395,21 @@ function applyMarkdownReplacement(
   action: GoogleDocReplaceAction,
   tabId: string,
 ): GoogleDocSimulatedContent {
-  let { oldMarkdown, newMarkdown } = action;
-  if (oldMarkdown === newMarkdown) return content;
-
+  let { oldMarkdown } = action;
+  let newMarkdown = canonicalizeMarkdownReplacement(oldMarkdown, action.newMarkdown);
   let start = findUniqueMarkdown(content.markdown, oldMarkdown, "replaceText", tabId);
-  let end = start + oldMarkdown.length;
-  assertMarkdownRangeEditable(content.protectedRanges, start, end);
-  let offset = newMarkdown.length - oldMarkdown.length;
+  if (oldMarkdown === newMarkdown) return content;
   return {
-    markdown: content.markdown.slice(0, start) + newMarkdown + content.markdown.slice(end),
-    protectedRanges: content.protectedRanges.map(range => range.mdEnd <= start ? range : {
-      mdStart: range.mdStart + offset,
-      mdEnd: range.mdEnd + offset,
-    }),
+    ...content,
+    ...applyMarkdownEdit(content, start, start + oldMarkdown.length, newMarkdown),
   };
 }
 
 function appendMarkdownForSimulation(markdown: string, appendedMarkdown: string): string {
-  let normalizedAppend = appendedMarkdown.endsWith("\n") ? appendedMarkdown : appendedMarkdown + "\n";
+  let terminatedAppend = appendedMarkdown + "\n";
 
-  if (markdown.length === 0) {
-    return normalizedAppend;
-  }
-
-  if (markdown.endsWith("\n\n")) {
-    return markdown + normalizedAppend;
-  }
-
-  if (markdown.endsWith("\n")) {
-    return markdown + "\n" + normalizedAppend;
-  }
-
-  return markdown + "\n\n" + normalizedAppend;
+  if (markdown.length === 0) return terminatedAppend;
+  return markdown + (markdown.endsWith("\n") ? "\n" : "\n\n") + terminatedAppend;
 }
 
 function applyGoogleDocActionToContent(
@@ -1423,9 +1423,11 @@ function applyGoogleDocActionToContent(
     case "replaceText":
       return applyMarkdownReplacement(content, action, tabId);
     case "appendText":
+      requireGoogleDocAppendIndex(content.appendIndex);
       return {
         ...content,
-        markdown: appendMarkdownForSimulation(content.markdown, action.markdown),
+        markdown: appendMarkdownForSimulation(
+          content.markdown, canonicalizeMarkdownForWrite(action.markdown)),
       };
     default:
       action satisfies never;
@@ -1545,12 +1547,13 @@ function materializeGoogleDocAction(
       return { tab, requests };
     }
 
-    case "appendText":
+    case "appendText": {
+      let appendIndex = requireGoogleDocAppendIndex(googleDocAppendIndex(tab));
       return {
         tab,
-        requests: markdownToDocRequests(
-            "\n" + action.markdown, tab.bodyEndIndex - 1, tab.tabId),
+        requests: markdownToDocRequests("\n" + action.markdown, appendIndex, tab.tabId),
       };
+    }
 
     default:
       action satisfies never;
@@ -1892,11 +1895,9 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
   async #getSimulatedContent(
     tabId: string | undefined,
     operation: "getContent" | "replaceText" | "appendText",
-  ): Promise<{
+  ): Promise<GoogleDocSimulatedContent & {
     snapshot: GoogleDocSnapshot,
     tab: GoogleDocTabSnapshot,
-    markdown: string,
-    protectedRanges: MarkdownRange[],
   }> {
     let snapshot = await this.#getSnapshot();
     let tab = resolveGoogleDocTab(snapshot, tabId, operation);
@@ -2050,14 +2051,14 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
     }
 
     let selected;
+    let renderedNewMarkdown: string;
     try {
       selected = await this.#getSimulatedContent(tabId, "replaceText");
       let start = findUniqueMarkdown(
         selected.markdown, oldMarkdown, "replaceText", selected.tab.tabId,
       );
-      assertMarkdownRangeEditable(
-        selected.protectedRanges, start, start + oldMarkdown.length,
-      );
+      renderedNewMarkdown = canonicalizeMarkdownReplacement(oldMarkdown, newMarkdown);
+      applyMarkdownEdit(selected, start, start + oldMarkdown.length, renderedNewMarkdown);
     } catch (error) {
       // The error says whether that tab, or that text, exists.
       await this.#approvalQueue.authorizeObservation({
@@ -2080,7 +2081,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
     };
 
     let oldPreview = previewMarkdown(oldMarkdown, 80);
-    let newPreview = previewMarkdown(newMarkdown, 80);
+    let newPreview = previewMarkdown(renderedNewMarkdown, 80);
     let actionId = this.#pendingActions.submit(action);
     this.#simulationCache.current = undefined;
 
@@ -2107,6 +2108,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
     let selected;
     try {
       selected = await this.#getSimulatedContent(tabId, "appendText");
+      requireGoogleDocAppendIndex(selected.appendIndex);
     } catch (error) {
       // The error says whether that tab exists, so the attempt discloses something too.
       await this.#approvalQueue.authorizeObservation({
@@ -2116,6 +2118,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
       throw error;
     }
     let {snapshot, tab} = selected;
+    let renderedMarkdown = canonicalizeMarkdownForWrite(markdown);
 
     let action: GoogleDocAction = {
       type: "appendText",
@@ -2127,7 +2130,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
       markdown,
     };
 
-    let preview = previewMarkdown(markdown, 100);
+    let preview = previewMarkdown(renderedMarkdown, 100);
     let actionId = this.#pendingActions.submit(action);
     this.#simulationCache.current = undefined;
 

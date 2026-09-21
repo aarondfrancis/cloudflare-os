@@ -17,7 +17,8 @@ import type {
   SpreadsheetValueMode,
 } from "./sheets-types";
 import {
-  applyMarkdownEdit, canonicalizeMarkdownForWrite, canonicalizeMarkdownReplacement,
+  applyMarkdownEdit, assertMarkdownWriteComplexity, canonicalizeMarkdownForWrite,
+  canonicalizeMarkdownReplacement,
   computeReplaceOperations, docTabToMarkdown, markdownToDocRequests, MARKDOWN_RENDERING_VERSION,
   type DocTabSnapshot, type EditableMarkdown,
 } from "./markdown-converter";
@@ -1363,6 +1364,32 @@ function previewMarkdown(markdown: string, maxLength: number): string {
   return markdown.length > maxLength ? markdown.slice(0, maxLength) + "..." : markdown;
 }
 
+const MAX_GOOGLE_DOC_ACTION_MARKDOWN_BYTES = 1024 * 1024;
+const googleDocActionEncoder = new TextEncoder();
+
+function assertGoogleDocActionMarkdownSize(...values: string[]): void {
+  let byteLength = 0;
+  for (let value of values) byteLength += value.length;
+  if (byteLength <= MAX_GOOGLE_DOC_ACTION_MARKDOWN_BYTES) {
+    byteLength = 0;
+    for (let value of values) {
+      byteLength += googleDocActionEncoder.encode(value).byteLength;
+      if (byteLength > MAX_GOOGLE_DOC_ACTION_MARKDOWN_BYTES) break;
+    }
+  }
+  if (byteLength > MAX_GOOGLE_DOC_ACTION_MARKDOWN_BYTES) {
+    throw new Error(
+      `Google Doc action Markdown exceeds the ${MAX_GOOGLE_DOC_ACTION_MARKDOWN_BYTES}-byte ` +
+      "safe submission limit.",
+    );
+  }
+  for (let value of values) assertMarkdownWriteComplexity(value);
+}
+
+function markdownApprovalBlock(markdown: string, maxLength: number): string {
+  return previewMarkdown(markdown, maxLength).split("\n").map(line => `    ${line}`).join("\n");
+}
+
 function findUniqueMarkdown(
   markdown: string,
   oldMarkdown: string,
@@ -2049,6 +2076,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
     if (oldMarkdown === newMarkdown) {
       return;
     }
+    assertGoogleDocActionMarkdownSize(oldMarkdown, newMarkdown);
 
     let selected;
     let renderedNewMarkdown: string;
@@ -2080,8 +2108,10 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
       newMarkdown,
     };
 
-    let oldPreview = previewMarkdown(oldMarkdown, 80);
-    let newPreview = previewMarkdown(renderedNewMarkdown, 80);
+    let oldPreview = markdownApprovalBlock(oldMarkdown, 80);
+    let newPreview = markdownApprovalBlock(renderedNewMarkdown, 80);
+    let requestedNewPreview = newMarkdown === renderedNewMarkdown ? "" :
+      `**Requested New:**\n\n${markdownApprovalBlock(newMarkdown, 80)}\n\n`;
     let actionId = this.#pendingActions.submit(action);
     this.#simulationCache.current = undefined;
 
@@ -2090,8 +2120,9 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
         title: "Edit Google Doc",
         description:
           `Replace text in tab ${googleDocTabLabel(tab)}.\n\n` +
-          `**Old:** ${oldPreview}\n\n` +
-          `**New:** ${newPreview}`,
+          `**Old:**\n\n${oldPreview}\n\n` +
+          requestedNewPreview +
+          `**New:**\n\n${newPreview}`,
         implementsRevert: false,
         // Group all document edits under one tag
         actionKind: EDIT_DOCUMENT_ACTION,
@@ -2105,6 +2136,7 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
   }
 
   async appendText(markdown: string, tabId?: string): Promise<void> {
+    assertGoogleDocActionMarkdownSize(markdown);
     let selected;
     try {
       selected = await this.#getSimulatedContent(tabId, "appendText");
@@ -2130,14 +2162,18 @@ class GoogleDocSessionImpl extends RpcTarget implements GoogleDocSession {
       markdown,
     };
 
-    let preview = previewMarkdown(renderedMarkdown, 100);
+    let renderedPreview = markdownApprovalBlock(renderedMarkdown, 100);
+    let contentPreview = markdown === renderedMarkdown ? renderedPreview :
+      `**Requested:**\n\n${markdownApprovalBlock(markdown, 100)}\n\n` +
+      `**Resulting:**\n\n${renderedPreview}`;
     let actionId = this.#pendingActions.submit(action);
     this.#simulationCache.current = undefined;
 
     try {
       await this.#approvalQueue.submitAction(actionId, {
         title: "Append to Google Doc",
-        description: `Append content to the end of tab ${googleDocTabLabel(tab)}:\n\n${preview}`,
+        description:
+          `Append content to the end of tab ${googleDocTabLabel(tab)}:\n\n${contentPreview}`,
         implementsRevert: false,
         // Same "editDocument" tag as replaceText
         actionKind: EDIT_DOCUMENT_ACTION,

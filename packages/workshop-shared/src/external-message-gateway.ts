@@ -1,4 +1,5 @@
 import type { RpcStub, RpcTarget } from "cloudflare:workers";
+import type { AiChatAuthorInfo } from "./api";
 
 /** A completed Gadget response that should be delivered back to the chat gateway. */
 export type GadgetResponse = {
@@ -31,6 +32,8 @@ export type SubmitExternalMessageInput = {
   gadgetTitle: string;
   /** User text sent to Gadgets. */
   prompt: string;
+  /** Optional model for this turn, validated against the caller's available models. */
+  modelId?: string;
   /** Persistent target invoked when the Gadget response is ready. */
   chatGatewayRpcTarget: RpcStub<ChatGatewayRpcTarget>;
 };
@@ -49,6 +52,8 @@ export type SubmitExternalMessageResult =
 
 /** Service binding RPC interface used by chat gateway workers. */
 export interface ExternalMessageGateway {
+  /** Models available to the gateway's trusted caller account. */
+  listModels(callerEmail: string): Promise<AiChatAuthorInfo[]>;
   /** Submit an external chat message for Gadget routing and execution. */
   submitExternalMessage(input: SubmitExternalMessageInput): Promise<SubmitExternalMessageResult>;
 }

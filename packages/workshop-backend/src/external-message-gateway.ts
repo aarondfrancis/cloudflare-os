@@ -1,5 +1,6 @@
 import { WorkerEntrypoint } from "cloudflare:workers";
 import { validateRpc } from "capnweb-validate";
+import type { AiChatAuthorInfo } from "@gadgets/workshop-shared/api";
 import {
   type ExternalMessageGateway as ExternalMessageGatewayContract,
   type SubmitExternalMessageInput,
@@ -12,6 +13,11 @@ type ExternalMessageGatewayProps = {
 
 @validateRpc()
 export class ExternalMessageGateway extends WorkerEntrypoint<Cloudflare.Env, ExternalMessageGatewayProps> implements ExternalMessageGatewayContract {
+  async listModels(callerEmail: string): Promise<AiChatAuthorInfo[]> {
+    const caller = this.ctx.exports.UserDurableObject.getByName(callerEmail);
+    return await caller.whoamiIfExists() ? caller.listModels() : [];
+  }
+
   async submitExternalMessage(input: SubmitExternalMessageInput): Promise<SubmitExternalMessageResult> {
     let source = this.ctx.props.source;
     if (!source) throw new Error("ExternalMessageGateway source prop is required.");
@@ -32,6 +38,7 @@ export class ExternalMessageGateway extends WorkerEntrypoint<Cloudflare.Env, Ext
       externalChatKey: externalKeys.chat,
       idempotencyKey: externalKeys.message,
       prompt: input.prompt,
+      modelId: input.modelId,
       chatGatewayRpcTarget: input.chatGatewayRpcTarget,
       title: input.gadgetTitle,
     });

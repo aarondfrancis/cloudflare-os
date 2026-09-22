@@ -1180,7 +1180,7 @@ describe("Google Doc write receipts", () => {
     );
   });
 
-  it("canonicalizes replay of an append stored before rendered previews", async () => {
+  it("drops an append stored under an earlier Markdown version", async () => {
     let docs = new DocsModel();
     docs.setText(MAIN_TAB, "base");
     docs.install();
@@ -1197,7 +1197,7 @@ describe("Google Doc write receipts", () => {
       },
     }]);
 
-    expect(await hooks().readContent(facet)).toBe("base\n\n* literal\n");
+    expect(await hooks().readContent(facet)).toBe("base\n");
   });
 
   it("stores one copy of an append payload", async () => {

@@ -894,6 +894,7 @@ type ExternalMessageSubmitInput = {
   externalChatKey: string;
   idempotencyKey: string;
   prompt: string;
+  modelId?: string;
   chatGatewayRpcTarget: NativeRpcStub<ChatGatewayRpcTarget>;
   title: string;
 };
@@ -10094,8 +10095,12 @@ export class OverseerDurableObject extends DurableObject<Cloudflare.Env> {
       }
     }
 
-    // Resolve the caller's profile and model.
-    let userContext = await caller.getExternalMessageChatContext(modelId);
+    // A gateway-selected model overrides the previous chat model without starting a new chat.
+    // Resolve it only from models available to the authenticated caller.
+    if (input.modelId !== undefined && !(await caller.listModels()).some(model => model.id === input.modelId)) {
+      return { accepted: false, message: "The selected AI model is no longer available." };
+    }
+    let userContext = await caller.getExternalMessageChatContext(input.modelId ?? modelId);
 
     // The caller must have an available agent model.
     let aiModel = userContext.aiModel;

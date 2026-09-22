@@ -1207,7 +1207,9 @@ export type ObservationDescription = {
    * - Once observed, the gadget enters a restricted mode: no public-web fetches, and every action
    *   requires manual approval -- auto-approval rules are suspended. The approver is shown the
    *   action's full `description` and is responsible for checking it contains none of the
-   *   restricted data; the kernel does not restrict which connections may be acted on.
+   *   restricted data, so the overseer accepts only actions whose gatekeeper declares a complete
+   *   description (`ActionDescription.descriptionIsComplete`) and refuses the rest, including
+   *   every git push; the kernel does not restrict which connections may be acted on.
    *
    * TODO(someday): The restricted mode is a blunt instrument. It should be possible to perform
    *   actions whose visibility is limited to people verified to have access to the same data: an

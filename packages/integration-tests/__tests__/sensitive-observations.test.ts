@@ -6,8 +6,8 @@
 // against the new scope. So sensitive observations are not blocked by an unverified collaborator,
 // and sharing stays available. The observation also sets `containsRestrictedData`, putting the
 // workspace into a restricted mode: once it is set, every action pends for manual approval and is
-// never auto-approved, and the workspace may not fetch from the web (which has no client-reachable
-// surface to assert here). An observation that also carries `ownerInvitesOnly` sets that flag too:
+// never auto-approved, an action whose description is not declared complete is refused, and the
+// workspace may not fetch from the web (which has no client-reachable surface to assert here). An observation that also carries `ownerInvitesOnly` sets that flag too:
 // from then on only direct grants from the owner count, so share links stop admitting anyone and
 // people who joined through one lose access.
 //
@@ -240,6 +240,12 @@ describe("sensitive observations", () => {
       await expect(ws.session.readValue(true)).resolves.toBe(42);
 
       expect((await ws.overseer.getMetadata()).containsRestrictedData).toBe(true);
+
+      // A write whose gatekeeper does not vouch for its description is refused before it is
+      // recorded: the approver can only check text that shows everything the action sends.
+      await expect(ws.session.writeValue(0, { incomplete: true }))
+          .rejects.toThrow(/description shows the approver everything it will send/);
+      expect((await ws.overseer.listActions({ filter: "pending" })).entries).toEqual([]);
 
       // A write back to the producing connection is held for approval and goes through once
       // approved...

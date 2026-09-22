@@ -56,10 +56,12 @@ function seedRestrictedObservation(impl: any, gatekeeperId: number, actionId: nu
   impl.storage.containsRestrictedData.put(true);
 }
 
-function pokeDescription(autoApprovable = false): ActionDescription {
+function pokeDescription(autoApprovable = false, { incomplete = false } = {}): ActionDescription {
   return {
     title: "Poke the thing",
     description: "The test poked the thing.",
+    // What a real gatekeeper asserts when its text shows everything the action will send.
+    ...(incomplete ? {} : { descriptionIsComplete: true }),
     implementsRevert: false,
     actionKind: { tag: "poke", label: "Pokes" },
     ...(autoApprovable ? { autoApprovable: true } : {}),
@@ -118,6 +120,53 @@ describe("submitAction under the restricted-data latch", () => {
       impl.getGatekeeperFacet = () => ({ async applyAction() {} });
       await impl.applyPendingAction(record, USER, false);
       expect(actionStates(impl)).toEqual([{ gatekeeperId: 2, state: "approved" }]);
+    });
+  });
+
+  it("refuses an incomplete description while restricted, writing no record", async () => {
+    let stub = env.TEST_OVERSEER.getByName("restricted-actions-incomplete");
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      let impl = getImpl(instance);
+      seedGatekeeper(impl, 1);
+      seedGatekeeper(impl, 2);
+
+      // Unrestricted, a summary is fine: the approver is not vouching against a leak.
+      await impl.submitAction(2, 0, pokeDescription(false, { incomplete: true }), CALLER);
+      seedRestrictedObservation(impl, 1, 100);
+      let nextActionId = impl.storage.nextActionId.get();
+
+      // Restricted, the same summary is refused on any connection, and nothing is recorded.
+      for (let gatekeeperId of [1, 2]) {
+        await expect(impl.submitAction(gatekeeperId, 0, pokeDescription(false, { incomplete: true }),
+                                       CALLER))
+            .rejects.toThrow(/this connection's description does not/i);
+      }
+      expect(actionStates(impl)).toEqual([{ gatekeeperId: 2, state: "pending" }]);
+      expect(impl.storage.nextActionId.get()).toBe(nextActionId);
+
+      // A complete description still pends as before.
+      await impl.submitAction(1, 0, pokeDescription(), CALLER);
+      expect(actionStates(impl)).toEqual([
+        { gatekeeperId: 2, state: "pending" },
+        { gatekeeperId: 1, state: "pending" },
+      ]);
+    });
+  });
+
+  it("refuses a push while restricted, even one claiming a complete description", async () => {
+    let stub = env.TEST_OVERSEER.getByName("restricted-actions-push");
+    await runInDurableObject(stub, async (instance: OverseerDurableObject) => {
+      let impl = getImpl(instance);
+      seedGatekeeper(impl, 1);
+      seedRestrictedObservation(impl, 1, 100);
+
+      // Commits cannot be reviewed as text, so the claim does not count. Refused before push
+      // ancestry is even checked, which is why an unproven head is fine here.
+      await expect(impl.submitAction(1, 0, {
+        ...pokeDescription(),
+        pushedCommits: ["0123456789abcdef0123456789abcdef01234567"],
+      }, CALLER)).rejects.toThrow(/git push cannot be reviewed as text yet/i);
+      expect(actionStates(impl)).toEqual([]);
     });
   });
 

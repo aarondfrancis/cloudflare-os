@@ -2202,6 +2202,10 @@ class OverseerImpl implements AgentHooks {
           entry satisfies never;
       }
     }
+    // External HomeOS turns carry a private, per-message RPC target. Expose it only while that
+    // message is waiting for a response; its Worker enforces the owner's live tool allowlist.
+    const external = this.storage.gadgetResponseDeliveries.undeliveredByChatId.get(chatId);
+    if (external?.status === "waiting") env.HOMEOS_AGENT = external.chatGatewayRpcTarget;
     return env;
   }
 
